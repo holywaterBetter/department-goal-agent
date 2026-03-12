@@ -15,10 +15,23 @@ from agents.goal_normalizer import GoalNormalizerAgent
 from pipeline.aggregator import Aggregator
 from schemas.models import GoalInput
 from services.llm_client import LLMClient
+from validators.contracts import validate_pipeline_contracts
+
+
+class PipelineStageError(RuntimeError):
+    """Raised when a pipeline stage fails with additional context."""
 
 
 def load_goals(csv_path: str) -> list[GoalInput]:
-    df = pd.read_csv(csv_path)
+    try:
+        df = pd.read_csv(csv_path, encoding="utf-8-sig")
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"Input CSV not found: {csv_path}") from exc
+    except OSError as exc:
+        raise OSError(f"Failed to read input CSV: {csv_path}") from exc
+
+    df.columns = [str(col).strip().lstrip("\ufeff") for col in df.columns]
+
     expected_cols = [
         "employee",
         "goal_title",
@@ -33,17 +46,21 @@ def load_goals(csv_path: str) -> list[GoalInput]:
 
     goals: list[GoalInput] = []
     for idx, row in df.iterrows():
-        goals.append(
-            GoalInput(
-                goal_id=f"GOAL_{idx + 1:04d}",
-                employee=str(row["employee"]).strip(),
-                goal_title=str(row["goal_title"]).strip(),
-                general_goal=str(row["general_goal"]).strip(),
-                challenge_goal=str(row["challenge_goal"]).strip(),
-                category=str(row["category"]).strip(),
-                weight=float(row["weight"]),
+        try:
+            goals.append(
+                GoalInput(
+                    goal_id=f"GOAL_{idx + 1:04d}",
+                    employee=str(row["employee"]).strip(),
+                    goal_title=str(row["goal_title"]).strip(),
+                    general_goal=str(row["general_goal"]).strip(),
+                    challenge_goal=str(row["challenge_goal"]).strip(),
+                    category=str(row["category"]).strip(),
+                    weight=float(row["weight"]),
+                )
             )
-        )
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(f"Invalid row at index {idx} in goals CSV: {exc}") from exc
+
     return goals
 
 
@@ -54,28 +71,57 @@ def main() -> None:
     department_path = "data/intermediate/department_tasks.json"
     output_csv = "data/output/department_work.csv"
 
-    goals = load_goals(input_csv)
+    try:
+        goals = load_goals(input_csv)
+    except Exception as exc:  # noqa: BLE001
+        raise PipelineStageError(f"[Load CSV] Failed to load goals from {input_csv}: {exc}") from exc
 
-    llm_client = LLMClient.from_env()
+    try:
+        llm_client = LLMClient.from_env()
+    except Exception as exc:  # noqa: BLE001
+        raise PipelineStageError(f"[LLM Init] Failed to initialize LLM client: {exc}") from exc
 
     normalizer = GoalNormalizerAgent(llm_client=llm_client)
     cluster_agent = ClusterAgent(llm_client=llm_client)
     department_agent = DepartmentTaskAgent(llm_client=llm_client)
 
-    normalized = normalizer.run(goals=goals, output_path=normalized_path)
-    clusters = cluster_agent.run(normalized_goals=normalized, output_path=cluster_path)
-    department_tasks = department_agent.run(
-        normalized_goals=normalized,
-        clusters=clusters,
-        output_path=department_path,
-    )
+    try:
+        normalized = normalizer.run(goals=goals, output_path=normalized_path)
+    except Exception as exc:  # noqa: BLE001
+        raise PipelineStageError(f"[GoalNormalizerAgent] Failed: {exc}") from exc
 
-    Aggregator.aggregate(
-        normalized_goals=normalized,
-        clusters=clusters,
-        department_tasks=department_tasks,
-        output_path=output_csv,
-    )
+    try:
+        clusters = cluster_agent.run(normalized_goals=normalized, output_path=cluster_path)
+    except Exception as exc:  # noqa: BLE001
+        raise PipelineStageError(f"[ClusterAgent] Failed: {exc}") from exc
+
+    try:
+        department_tasks = department_agent.run(
+            normalized_goals=normalized,
+            clusters=clusters,
+            output_path=department_path,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise PipelineStageError(f"[DepartmentTaskAgent] Failed: {exc}") from exc
+
+    try:
+        validate_pipeline_contracts(
+            normalized_goals=normalized,
+            clusters=clusters,
+            department_tasks=department_tasks,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise PipelineStageError(f"[Contract Validation] Failed: {exc}") from exc
+
+    try:
+        Aggregator.aggregate(
+            normalized_goals=normalized,
+            clusters=clusters,
+            department_tasks=department_tasks,
+            output_path=output_csv,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise PipelineStageError(f"[Aggregator] Failed: {exc}") from exc
 
     print("Pipeline completed successfully.")
     print(f"- {normalized_path}")

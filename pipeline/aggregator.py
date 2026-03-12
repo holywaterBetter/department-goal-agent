@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pandas as pd
 
 from schemas.models import ClusterAssignments, DepartmentTasks, NormalizedGoals
@@ -17,7 +19,29 @@ class Aggregator:
         clusters_df = pd.DataFrame([item.model_dump() for item in clusters.clusters])
         tasks_df = pd.DataFrame([item.model_dump() for item in department_tasks.department_tasks])
 
-        merged = goals_df.merge(clusters_df, on="goal_id", how="inner")
+        if goals_df.empty:
+            raise ValueError("Aggregator received no normalized goals.")
+
+        goal_ids = set(goals_df["goal_id"].tolist())
+        cluster_goal_ids = set(clusters_df["goal_id"].tolist())
+        missing_goal_ids = sorted(goal_ids - cluster_goal_ids)
+        if missing_goal_ids:
+            raise ValueError(
+                "Aggregator found goals without cluster assignments: " + ", ".join(missing_goal_ids)
+            )
+
+        merged = goals_df.merge(clusters_df, on="goal_id", how="left", validate="one_to_one")
+        if merged["cluster_id"].isna().any():
+            missing_after_merge = merged.loc[merged["cluster_id"].isna(), "goal_id"].tolist()
+            raise ValueError(
+                "Aggregator merge produced unassigned goals: " + ", ".join(sorted(missing_after_merge))
+            )
+
+        merged_rows = len(merged)
+        if merged_rows != len(goals_df):
+            raise ValueError(
+                f"Aggregator row mismatch: expected {len(goals_df)} rows from goals, got {merged_rows}"
+            )
 
         cluster_stats = (
             merged.groupby("cluster_id", as_index=False)
@@ -49,11 +73,22 @@ class Aggregator:
         )
 
         final_df = (
-            tasks_df.merge(cluster_stats, on="cluster_id", how="left")
-            .merge(employee_pivot, on="cluster_id", how="left")
+            tasks_df.merge(cluster_stats, on="cluster_id", how="left", validate="one_to_one")
+            .merge(employee_pivot, on="cluster_id", how="left", validate="one_to_one")
             .sort_values("cluster_id")
             .reset_index(drop=True)
         )
+
+        required_task_columns = {
+            "representative_category",
+            "department_task_name",
+            "department_general_objective",
+            "department_challenge_objective",
+            "owner_candidate",
+        }
+        missing_task_columns = sorted(required_task_columns - set(final_df.columns))
+        if missing_task_columns:
+            raise ValueError("Aggregator missing required department task columns: " + ", ".join(missing_task_columns))
 
         final_df.insert(0, "no", final_df.index + 1)
         final_df = final_df.rename(
@@ -84,11 +119,23 @@ class Aggregator:
             if col not in final_df.columns:
                 final_df[col] = 0.0
 
+        missing_final_columns = [col for col in ordered_columns if col not in final_df.columns]
+        if missing_final_columns:
+            raise ValueError(
+                "Aggregator missing required final output columns: " + ", ".join(missing_final_columns)
+            )
+
         final_df = final_df[ordered_columns]
         final_df["가중치합"] = final_df["가중치합"].round(4)
         final_df["가중치합 비중"] = final_df["가중치합 비중"].round(4)
         for col in employee_columns:
             final_df[col] = final_df[col].round(4)
 
-        final_df.to_csv(output_path, index=False, encoding="utf-8-sig")
+        output_file = Path(output_path)
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            final_df.to_csv(output_file, index=False, encoding="utf-8-sig")
+        except OSError as exc:
+            raise OSError(f"Aggregator failed to write output CSV: {output_file}") from exc
+
         return final_df
